@@ -1,0 +1,30 @@
+databricks:
+  host: "your-databricks-host"
+  token: "your-databricks-token"
+  cluster_id: "your-cluster-id"
+
+profiling:
+  metrics:
+    - count
+    - distinct_count
+    - null_count
+    - min
+    - max
+    - mean
+    - stddev
+    - percentiles: [25, 50, 75]
+  time_grain: "business_dt"  # Default time grain column
+  batch_size: 1000  # Number of records to process in each batch
+
+anomaly:
+  detection_methods:
+    - statistical
+    - machine_learning
+  threshold: 0.95  # Confidence threshold for anomaly detection
+  lookback_days: 30  # Number of days to consider for historical analysis
+
+delta:
+  catalog: "your_catalog"
+  schema: "data_quality"
+  profiling_table: "table_profiling_results"
+  anomaly_table: "anomaly_detection_results" 

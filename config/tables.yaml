@@ -1,0 +1,21 @@
+tables:
+  - name: "sales_data"
+    database: "sales"
+    key_fields:
+      - "customer_id"
+      - "product_id"
+    time_grain: "business_dt"
+    anomaly_fields:
+      - "amount"
+      - "quantity"
+    profiling_frequency: "daily"
+
+  - name: "customer_data"
+    database: "customer"
+    key_fields:
+      - "customer_id"
+    time_grain: "business_dt"
+    anomaly_fields:
+      - "credit_score"
+      - "purchase_frequency"
+    profiling_frequency: "weekly" 
