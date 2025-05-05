@@ -12,12 +12,22 @@ class DataProfiler:
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
     
-    def _apply_field_standardization(self, df: DataFrame) -> DataFrame:
+    def _get_table_config(self, table_name: str) -> Dict[str, Any]:
+        """Get configuration for a specific table."""
+        if table_name not in self.config['tables']:
+            raise ValueError(f"Table '{table_name}' not found in configuration")
+        return self.config['tables'][table_name]
+    
+    def _get_global_setting(self, section: str, key: str, default: Any = None) -> Any:
+        """Get a global setting with fallback to default value."""
+        return self.config['settings'].get(section, {}).get(key, default)
+    
+    def _apply_field_standardization(self, df: DataFrame, table_config: Dict[str, Any]) -> DataFrame:
         """Apply SQL expressions to standardize fields before profiling."""
         select_exprs = []
         
         # Add standardized columns from configuration
-        for field_name, field_config in self.config['fields'].items():
+        for field_name, field_config in table_config['fields'].items():
             if 'standardization' in field_config:
                 select_exprs.append(f"{field_config['standardization']} as {field_name}")
             else:
@@ -74,11 +84,11 @@ class DataProfiler:
         
         return metrics
     
-    def _calculate_custom_metrics(self, df: DataFrame) -> Dict[str, Any]:
+    def _calculate_custom_metrics(self, df: DataFrame, table_config: Dict[str, Any]) -> Dict[str, Any]:
         """Calculate custom metrics defined in the configuration."""
         custom_metrics = {}
         
-        for metric in self.config['custom_metrics']:
+        for metric in table_config.get('custom_metrics', []):
             result = df.selectExpr(metric['expression']).collect()[0][0]
             custom_metrics[metric['name']] = {
                 'value': result,
@@ -87,18 +97,26 @@ class DataProfiler:
         
         return custom_metrics
     
-    def profile_data(self, df: DataFrame, table_name: str, database: str) -> Dict[str, Any]:
-        """Profile the data using field-specific configurations."""
-        # Apply field standardization
-        df = self._apply_field_standardization(df)
+    def profile_table(self, table_name: str) -> Dict[str, Any]:
+        """Profile a table using its specific configuration."""
+        # Get table configuration
+        table_config = self._get_table_config(table_name)
+        database = table_config['database']
         
-        # Get sample if configured
-        if 'sample_size' in self.config['profiling']:
-            sample_size = self.config['profiling']['sample_size']
-            if isinstance(sample_size, float) and 0 < sample_size < 1:
-                df = df.sample(sample_size)
-            elif isinstance(sample_size, int) and sample_size > 0:
-                df = df.limit(sample_size)
+        # Read the table
+        df = self.spark.table(f"{database}.{table_name}")
+        
+        # Apply field standardization
+        df = self._apply_field_standardization(df, table_config)
+        
+        # Get sample size (table-specific or default)
+        sample_size = table_config.get('sample_size', 
+            self._get_global_setting('profiling', 'default_sample_size', 0.1))
+        
+        if isinstance(sample_size, float) and 0 < sample_size < 1:
+            df = df.sample(sample_size)
+        elif isinstance(sample_size, int) and sample_size > 0:
+            df = df.limit(sample_size)
         
         # Initialize results
         results = {
@@ -106,19 +124,19 @@ class DataProfiler:
             'database': database,
             'profile_date': datetime.now().isoformat(),
             'row_count': df.count(),
-            'column_count': len(self.config['fields']),
+            'column_count': len(table_config['fields']),
             'fields': {}
         }
         
         # Profile each configured field
-        for field_name, field_config in self.config['fields'].items():
+        for field_name, field_config in table_config['fields'].items():
             results['fields'][field_name] = {
                 'source_column': field_config['source_column'],
                 'metrics': self._calculate_field_metrics(df, field_name, field_config)
             }
         
         # Add custom metrics
-        results['custom_metrics'] = self._calculate_custom_metrics(df)
+        results['custom_metrics'] = self._calculate_custom_metrics(df, table_config)
         
         # Save results
         self._save_profile_results(results)
@@ -127,9 +145,9 @@ class DataProfiler:
     
     def _save_profile_results(self, results: Dict[str, Any]):
         """Save profiling results to Delta table."""
-        catalog = self.config['storage']['catalog']
-        schema = self.config['storage']['schema']
-        table = self.config['storage']['tables']['profiles']
+        catalog = self._get_global_setting('storage', 'catalog')
+        schema = self._get_global_setting('storage', 'schema')
+        table = self._get_global_setting('storage', 'tables')['profiles']
         
         # Convert results to DataFrame with a single row
         results_df = self.spark.createDataFrame([(
