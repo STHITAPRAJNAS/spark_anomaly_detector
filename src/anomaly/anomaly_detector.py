@@ -8,12 +8,111 @@ from typing import List, Dict, Any
 import numpy as np
 import yaml
 import json
+from datetime import datetime
+from .advanced_anomaly_detector import AdvancedAnomalyDetector
 
 class AnomalyDetector:
     def __init__(self, spark: SparkSession, config_path: str = "config/config.yaml"):
         self.spark = spark
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
+        self.advanced_detector = AdvancedAnomalyDetector(spark, config_path)
+    
+    def detect_anomalies(self, df: DataFrame, table_name: str, database: str) -> Dict[str, Any]:
+        """Detect anomalies using multiple methods."""
+        results = {
+            'table_name': table_name,
+            'database': database,
+            'detection_date': datetime.now().isoformat(),
+            'anomalies': {}
+        }
+        
+        # Get column types
+        numeric_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, NumericType)]
+        string_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, StringType)]
+        date_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, (DateType, TimestampType))]
+        
+        # Basic statistical anomalies
+        for col_name in numeric_cols:
+            stats = df.select(
+                mean(col(col_name)).alias('mean'),
+                stddev(col(col_name)).alias('stddev')
+            ).collect()[0]
+            
+            if stats['stddev'] is not None:
+                df = df.withColumn(
+                    f'{col_name}_zscore',
+                    (col(col_name) - stats['mean']) / stats['stddev']
+                )
+                
+                anomalies = df.filter(
+                    abs(col(f'{col_name}_zscore')) > self.config['anomaly']['threshold']
+                ).count()
+                
+                results['anomalies'][f'statistical_{col_name}'] = {
+                    'count': anomalies,
+                    'method': 'zscore',
+                    'threshold': self.config['anomaly']['threshold']
+                }
+        
+        # Advanced ML-based detection
+        if numeric_cols:
+            # Multivariate anomalies
+            mv_results = self.advanced_detector.detect_multivariate_anomalies(df, numeric_cols)
+            mv_anomalies = mv_results.filter(col('is_anomaly')).count()
+            results['anomalies']['multivariate'] = {
+                'count': mv_anomalies,
+                'method': 'ensemble',
+                'features': numeric_cols
+            }
+            
+            # Distribution anomalies
+            for col_name in numeric_cols:
+                dist_results = self.advanced_detector.detect_distribution_anomalies(df, col_name)
+                dist_anomalies = dist_results.filter(col('is_anomaly')).count()
+                results['anomalies'][f'distribution_{col_name}'] = {
+                    'count': dist_anomalies,
+                    'method': 'distribution_fit'
+                }
+        
+        # Pattern anomalies for string columns
+        for col_name in string_cols:
+            pattern_results = self.advanced_detector.detect_pattern_anomalies(df, col_name)
+            pattern_anomalies = pattern_results.filter(col('is_anomaly')).count()
+            results['anomalies'][f'pattern_{col_name}'] = {
+                'count': pattern_anomalies,
+                'method': 'pattern_analysis'
+            }
+        
+        # Correlation anomalies
+        if len(numeric_cols) > 1:
+            corr_results = self.advanced_detector.detect_correlation_anomalies(df, numeric_cols)
+            corr_anomalies = sum(
+                corr_results.filter(col(f'is_anomaly_{col}')).count()
+                for col in numeric_cols
+            )
+            results['anomalies']['correlation'] = {
+                'count': corr_anomalies,
+                'method': 'correlation_analysis',
+                'features': numeric_cols
+            }
+        
+        # Time series anomalies if date column exists
+        if date_cols and numeric_cols:
+            time_col = date_cols[0]  # Use first date column
+            for num_col in numeric_cols:
+                ts_results = self.advanced_detector.detect_temporal_anomalies(df, num_col, time_col)
+                ts_anomalies = ts_results.filter(col('is_anomaly')).count()
+                results['anomalies'][f'temporal_{num_col}'] = {
+                    'count': ts_anomalies,
+                    'method': 'prophet',
+                    'time_column': time_col
+                }
+        
+        # Save results
+        self.advanced_detector.save_anomaly_results(results)
+        
+        return results
     
     def detect_statistical_anomalies(self, df: DataFrame, column: str) -> DataFrame:
         """Detect anomalies using statistical methods."""

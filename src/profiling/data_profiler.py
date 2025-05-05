@@ -1,115 +1,146 @@
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, count, countDistinct, min, max, mean, stddev, approx_percentile, length, regexp_replace, trim, when, lit, to_json, struct
-from pyspark.sql.types import StringType, NumericType, DateType, TimestampType, StructType, StructField, StringType as SparkStringType
+from pyspark.sql.functions import col, lit, when, count, countDistinct, mean, stddev, min, max, approx_percentile, length, regexp_replace, trim, dayofweek
+from pyspark.sql.types import StringType, NumericType, DateType, TimestampType
 from typing import List, Dict, Any
 import yaml
-import os
 import json
+from datetime import datetime
 
 class DataProfiler:
     def __init__(self, spark: SparkSession, config_path: str = "config/config.yaml"):
         self.spark = spark
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
+    
+    def _apply_field_standardization(self, df: DataFrame) -> DataFrame:
+        """Apply SQL expressions to standardize fields before profiling."""
+        select_exprs = []
         
-    def calculate_metrics(self, df: DataFrame, column: str) -> Dict[str, Any]:
-        """Calculate profiling metrics for a specific column."""
+        # Add standardized columns from configuration
+        for field_name, field_config in self.config['fields'].items():
+            if 'standardization' in field_config:
+                select_exprs.append(f"{field_config['standardization']} as {field_name}")
+            else:
+                select_exprs.append(f"{field_config['source_column']} as {field_name}")
+        
+        # Apply the transformations
+        return df.selectExpr(*select_exprs)
+    
+    def _calculate_field_metrics(self, df: DataFrame, field_name: str, field_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate metrics for a specific field based on its configuration."""
         metrics = {}
-        col_type = df.schema[column].dataType
         
-        # Basic metrics for all types
-        metrics['count'] = df.select(count(col(column))).collect()[0][0]
-        metrics['distinct_count'] = df.select(countDistinct(col(column))).collect()[0][0]
-        metrics['null_count'] = df.filter(col(column).isNull()).count()
-        metrics['null_percentage'] = (metrics['null_count'] / metrics['count']) * 100 if metrics['count'] > 0 else 0
+        # Basic metrics available for all types
+        if 'null_count' in field_config['metrics']:
+            metrics['null_count'] = df.filter(col(field_name).isNull()).count()
+            metrics['null_percentage'] = (metrics['null_count'] / df.count()) * 100
         
         # Type-specific metrics
-        if isinstance(col_type, NumericType):
-            # Numeric metrics
-            metrics['min'] = df.select(min(col(column))).collect()[0][0]
-            metrics['max'] = df.select(max(col(column))).collect()[0][0]
-            metrics['mean'] = df.select(mean(col(column))).collect()[0][0]
-            metrics['stddev'] = df.select(stddev(col(column))).collect()[0][0]
-            metrics['variance'] = metrics['stddev'] ** 2 if metrics['stddev'] is not None else None
-            
-            # Calculate percentiles
-            percentiles = self.config['profiling']['metrics']['percentiles']
-            metrics['percentiles'] = df.select(
-                approx_percentile(col(column), percentiles, 0.01)
-            ).collect()[0][0]
-            
-            # Skewness and Kurtosis
-            metrics['skewness'] = df.select(
-                (mean(col(column)) - min(col(column))) / stddev(col(column))
-            ).collect()[0][0]
-            
-        elif isinstance(col_type, StringType):
-            # String metrics
-            metrics['min_length'] = df.select(min(length(col(column)))).collect()[0][0]
-            metrics['max_length'] = df.select(max(length(col(column)))).collect()[0][0]
-            metrics['avg_length'] = df.select(mean(length(col(column)))).collect()[0][0]
-            
-            # Pattern analysis
-            metrics['numeric_count'] = df.filter(col(column).rlike('^[0-9]+$')).count()
-            metrics['alpha_count'] = df.filter(col(column).rlike('^[a-zA-Z]+$')).count()
-            metrics['alphanumeric_count'] = df.filter(col(column).rlike('^[a-zA-Z0-9]+$')).count()
-            
-            # Top values for categorical data
-            top_values = df.groupBy(column).count().orderBy('count', ascending=False).limit(10)
-            metrics['top_values'] = {row[column]: row['count'] for row in top_values.collect()}
-            
-        elif isinstance(col_type, (DateType, TimestampType)):
-            # Date/Time metrics
-            metrics['min_date'] = df.select(min(col(column))).collect()[0][0]
-            metrics['max_date'] = df.select(max(col(column))).collect()[0][0]
-            metrics['date_range_days'] = (metrics['max_date'] - metrics['min_date']).days if metrics['max_date'] and metrics['min_date'] else None
-            
-            # Day of week distribution
-            day_dist = df.select(col(column).dayofweek().alias('day')).groupBy('day').count()
-            metrics['day_of_week_distribution'] = {row['day']: row['count'] for row in day_dist.collect()}
+        if isinstance(df.schema[field_name].dataType, NumericType):
+            if 'min' in field_config['metrics']:
+                metrics['min'] = df.select(min(col(field_name))).collect()[0][0]
+            if 'max' in field_config['metrics']:
+                metrics['max'] = df.select(max(col(field_name))).collect()[0][0]
+            if 'mean' in field_config['metrics']:
+                metrics['mean'] = df.select(mean(col(field_name))).collect()[0][0]
+            if 'stddev' in field_config['metrics']:
+                metrics['stddev'] = df.select(stddev(col(field_name))).collect()[0][0]
+            if 'percentiles' in field_config['metrics']:
+                percentiles = field_config.get('percentiles', [25, 50, 75])
+                metrics['percentiles'] = df.select(
+                    approx_percentile(col(field_name), percentiles, 0.01)
+                ).collect()[0][0]
         
-        # Data quality metrics
-        metrics['completeness'] = 1 - (metrics['null_count'] / metrics['count']) if metrics['count'] > 0 else 0
-        metrics['uniqueness'] = metrics['distinct_count'] / metrics['count'] if metrics['count'] > 0 else 0
+        elif isinstance(df.schema[field_name].dataType, StringType):
+            if 'distinct_count' in field_config['metrics']:
+                metrics['distinct_count'] = df.select(countDistinct(col(field_name))).collect()[0][0]
+            if 'empty_count' in field_config['metrics']:
+                metrics['empty_count'] = df.filter(col(field_name) == '').count()
+            if field_config.get('pattern_analysis', False):
+                metrics['pattern_analysis'] = {
+                    'numeric_count': df.filter(col(field_name).rlike('^[0-9]+$')).count(),
+                    'alpha_count': df.filter(col(field_name).rlike('^[a-zA-Z]+$')).count(),
+                    'alphanumeric_count': df.filter(col(field_name).rlike('^[a-zA-Z0-9]+$')).count()
+                }
+        
+        elif isinstance(df.schema[field_name].dataType, (DateType, TimestampType)):
+            if 'min' in field_config['metrics']:
+                metrics['min_date'] = str(df.select(min(col(field_name))).collect()[0][0])
+            if 'max' in field_config['metrics']:
+                metrics['max_date'] = str(df.select(max(col(field_name))).collect()[0][0])
+            if 'day_of_week_distribution' in field_config['metrics']:
+                day_dist = df.select(dayofweek(col(field_name)).alias('day')).groupBy('day').count()
+                metrics['day_of_week_distribution'] = {row['day']: row['count'] for row in day_dist.collect()}
         
         return metrics
     
-    def profile_table(self, table_name: str, database: str, time_grain: str) -> Dict[str, Any]:
-        """Profile a table and return results as a dictionary."""
-        df = self.spark.table(f"{database}.{table_name}")
+    def _calculate_custom_metrics(self, df: DataFrame) -> Dict[str, Any]:
+        """Calculate custom metrics defined in the configuration."""
+        custom_metrics = {}
         
-        # Get all columns to profile
-        columns = df.columns
+        for metric in self.config['custom_metrics']:
+            result = df.selectExpr(metric['expression']).collect()[0][0]
+            custom_metrics[metric['name']] = {
+                'value': result,
+                'description': metric['description']
+            }
         
-        # Initialize results dictionary
+        return custom_metrics
+    
+    def profile_data(self, df: DataFrame, table_name: str, database: str) -> Dict[str, Any]:
+        """Profile the data using field-specific configurations."""
+        # Apply field standardization
+        df = self._apply_field_standardization(df)
+        
+        # Get sample if configured
+        if 'sample_size' in self.config['profiling']:
+            sample_size = self.config['profiling']['sample_size']
+            if isinstance(sample_size, float) and 0 < sample_size < 1:
+                df = df.sample(sample_size)
+            elif isinstance(sample_size, int) and sample_size > 0:
+                df = df.limit(sample_size)
+        
+        # Initialize results
         results = {
             'table_name': table_name,
             'database': database,
-            'time_grain': time_grain,
-            'profiling_date': self.spark.sql("SELECT current_timestamp()").collect()[0][0],
-            'columns': {}
+            'profile_date': datetime.now().isoformat(),
+            'row_count': df.count(),
+            'column_count': len(self.config['fields']),
+            'fields': {}
         }
         
-        # Calculate metrics for each column
-        for column in columns:
-            results['columns'][column] = self.calculate_metrics(df, column)
+        # Profile each configured field
+        for field_name, field_config in self.config['fields'].items():
+            results['fields'][field_name] = {
+                'source_column': field_config['source_column'],
+                'metrics': self._calculate_field_metrics(df, field_name, field_config)
+            }
+        
+        # Add custom metrics
+        results['custom_metrics'] = self._calculate_custom_metrics(df)
+        
+        # Save results
+        self._save_profile_results(results)
         
         return results
     
-    def save_profiling_results(self, results: Dict[str, Any]):
-        """Save profiling results to Delta table as a single JSON record."""
-        catalog = self.config['delta']['catalog']
-        schema = self.config['delta']['schema']
-        table = self.config['delta']['profiling_table']
+    def _save_profile_results(self, results: Dict[str, Any]):
+        """Save profiling results to Delta table."""
+        catalog = self.config['storage']['catalog']
+        schema = self.config['storage']['schema']
+        table = self.config['storage']['tables']['profiles']
         
         # Convert results to DataFrame with a single row
         results_df = self.spark.createDataFrame([(
             results['table_name'],
             results['database'],
-            results['time_grain'],
-            results['profiling_date'],
-            json.dumps(results['columns'])
-        )], ['table_name', 'database', 'time_grain', 'profiling_date', 'profile_data'])
+            results['profile_date'],
+            results['row_count'],
+            results['column_count'],
+            json.dumps(results['fields']),
+            json.dumps(results['custom_metrics'])
+        )], ['table_name', 'database', 'profile_date', 'row_count', 'column_count', 'field_stats', 'custom_metrics'])
         
         # Write to Delta table
         results_df.write.format("delta").mode("append").saveAsTable(
